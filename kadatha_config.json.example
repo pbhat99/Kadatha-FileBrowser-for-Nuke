@@ -1,0 +1,19 @@
+{
+    "extensions": [
+        ".mov", ".mp4", ".mkv", ".exr", ".jpg", ".jpeg", ".png", 
+        ".dpx", ".tiff", ".tif", ".wav", ".mp3", ".abc", ".fbx", ".obj"
+    ],
+    "ignore_dirs": [
+        ".git", ".quarantine", "eryx_unreal_plugin", ".DS_Store", 
+        "thumbnail.jpg", "cache", "rendergallery.db", "rendergallery", 
+        ".svn", "__pycache__"
+    ],
+    "max_depth": 0,
+    "non_sequence_extensions": [
+        ".mov", ".mp4", ".abc", ".fbx", ".obj", ".wav", ".mp3"
+    ],
+    "thread_count": 4,
+    "version_regex": "[._]v(\\d+)|v(\\d+)",
+    "history_limit": 15,
+    "favorites_limit": 20
+}
