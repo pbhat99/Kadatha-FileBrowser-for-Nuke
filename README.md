@@ -55,11 +55,11 @@ Kadatha is a file browser plugin for **Nuke** designed to streamline asset manag
 
 
 ---
-
+    ![description](https://raw.githubusercontent.com/pbhat99/Kadatha-FileBrowser-for-Nuke/refs/heads/main/Preview/Kadatha_Main_Window.png)  
 ## Usage
 
 ### 1. Scanning a Directory
-1. Set the path in the top bar.
+1. Set the path in the top bar.      
 2. Click `Refresh` to start scanning.
 
 ### 2. Preview Files
@@ -75,7 +75,7 @@ Kadatha is a file browser plugin for **Nuke** designed to streamline asset manag
 - **Sam Richards**: Original concept and file scaner foundation.
 
 ---
-
+      
 ## License
 Apache License 2.0  
 Copyright (c) 2026 Prasannakumar T Bhat
