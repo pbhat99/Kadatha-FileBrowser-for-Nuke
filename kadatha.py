@@ -1157,7 +1157,7 @@ class Kadatha(QtWidgets.QWidget):
         depth_label.setToolTip("Search depth for subdirectories (0 = current folder only)")
         top_bar.addWidget(depth_label)
         self.depth_spin = QtWidgets.QSpinBox()
-        self.depth_spin.setRange(0, 9)
+        self.depth_spin.setRange(0, 25)
         self.depth_spin.setValue(self.scanner.max_depth)
         self.depth_spin.setToolTip("Search depth for subdirectories (0 = current folder only)")
         self.depth_spin.valueChanged.connect(self.depth_changed)
@@ -1774,7 +1774,27 @@ class Kadatha(QtWidgets.QWidget):
 
         
     def switch_view_mode(self, index):
+        if self.view_stack.currentIndex() == index:
+            # Already in this mode, toggle expansion for tree views
+            view = self.view_stack.currentWidget()
+            if isinstance(view, QtWidgets.QTreeView):
+                if not hasattr(self, '_tree_expanded_state'):
+                    self._tree_expanded_state = {}
+                
+                is_expanded = self._tree_expanded_state.get(index, False)
+                if is_expanded:
+                    view.collapseAll()
+                else:
+                    view.expandAll()
+                self._tree_expanded_state[index] = not is_expanded
+            return
+
         self.view_stack.setCurrentIndex(index)
+        # Reset state on switch
+        if not hasattr(self, '_tree_expanded_state'):
+            self._tree_expanded_state = {}
+        self._tree_expanded_state[index] = False
+        
         self.update_active_view_data()
         self.update_filters() # Re-apply filters to the new view
         self.save_user_settings()
@@ -1784,9 +1804,11 @@ class Kadatha(QtWidgets.QWidget):
         if not path:
             return ""
         import re
-        p = os.path.normpath(path).replace('\\', '/')
-        # Replace %0Nd, %d, ####, or trailing digits right before extension with @@@@
-        return re.sub(r'([._ ]?)(#+|%\d*d|\d+)(\.[^.\/\\]+)$', r'\1@@@@\3', p)
+        # Ensure path is normalized and lowercase for robust comparison
+        p = os.path.normpath(path).replace('\\', '/').lower()
+        # Match all types of padding: ####, %04d, %d, <UDIM>, %V, %v, or literal digits
+        # Replace the frame/token part right before extension with @@@@
+        return re.sub(r'([._ ]?)(#+|%\d*d|\d+|<UDIM>|<udim>|%[Vv])(\.[^.\/\\]+)$', r'\1@@@@\3', p)
 
     def get_imported_nuke_files(self):
         imported = {}
@@ -1794,11 +1816,14 @@ class Kadatha(QtWidgets.QWidget):
             return imported
         for node in nuke.allNodes(recurseGroups=True):
             if 'file' in node.knobs():
-                # Use nuke.filename() to get the resolved absolute path instead of just the knob value
-                fval = nuke.filename(node)
-                if fval:
-                    norm = os.path.normpath(fval).replace('\\', '/')
-                    imported[norm] = node.name()
+                try:
+                    # Use nuke.filename() to get the resolved absolute path instead of just the knob value
+                    fval = nuke.filename(node)
+                    if fval:
+                        norm = os.path.normpath(fval).replace('\\', '/').lower()
+                        imported[norm] = node.name()
+                except Exception:
+                    pass
         return imported
 
     def update_active_view_data(self):
@@ -1807,35 +1832,49 @@ class Kadatha(QtWidgets.QWidget):
             
         imported_files = self.get_imported_nuke_files()
         
-        # Precompute normalized mappings
+        # Precompute normalized mappings for padded files
         normalized_nuke = {}
         for n_path, node_name in imported_files.items():
             normalized_nuke[self._normalize_padding(n_path)] = node_name
             
-        # Update is_favorite flag for all items
+        # For base folder path checks, we need a list of all used paths
+        all_used_paths = list(imported_files.keys())
+            
+        # Update flags for all items in current view
         for item in self.cached_results:
             path = item.get("path")
             if path:
                 item["is_favorite"] = path in self.favorites
                 item["imported_node_name"] = None
                 
-                norm_path = os.path.abspath(path).replace('\\', '/')
+                # Normalize current item path
+                norm_path = os.path.normpath(path).replace('\\', '/').lower()
+                
+                # 1. Check for Direct Match
                 if norm_path in imported_files:
                     item["imported_node_name"] = imported_files[norm_path]
                 else:
+                    # 2. Check for Padded/Sequence Match
                     norm_padded = self._normalize_padding(norm_path)
                     if norm_padded in normalized_nuke:
                         item["imported_node_name"] = normalized_nuke[norm_padded]
+                
+                # 3. Base Folder Path Check: highlight folders that contain used files
+                if not item.get("imported_node_name") and item.get("is_folder"):
+                    # Ensure prefix ends with / for accurate sub-path matching
+                    folder_prefix = norm_path if norm_path.endswith("/") else norm_path + "/"
+                    for used_path in all_used_paths:
+                        if used_path.startswith(folder_prefix):
+                            item["imported_node_name"] = "In Use (Sub-folder content)"
+                            break
             
         idx = self.view_stack.currentIndex()
         if idx == 0: # List
             self.list_model.update_data(self.cached_results)
         elif idx == 1: # Tree
             self.tree_main_model.update_data(self.cached_results)
-            self.tree_view_main.expandAll()
         else: # Group
             self.group_model.update_data(self.cached_results)
-            self.group_view.expandAll()
             
     def sequence_toggle_changed(self, state):
         self.scanner.bundle_sequences = self.filter_sequences_cb.isChecked()
@@ -1950,24 +1989,50 @@ class Kadatha(QtWidgets.QWidget):
             self.scanner.stop()
             self.scan_worker.wait()
             
-        self.status_label.setText("Scanning...")
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
+        # Flush cache: clear results and update UI to show empty state
+        self.cached_results = []
+        self.update_active_view_data()
+        
+        # Force refresh of the sidebar directory tree
+        if hasattr(self, 'tree_model'):
+            self.tree_model.setRootPath("")
+            self.tree_model.setRootPath(self.current_path)
+            
+        # Recreate scanner to ensure fresh thread pool and settings
+        self.scanner = FileScanner(self.config)
+        
+        self.status_label.setText("Flushing cache & Scanning...")
+        self.progress_bar.setRange(0, 0) # Indeterminate until first progress update
         self.progress_bar.show()
         
         worker = ScanWorker(self.scanner, self.current_path, self)
         self.scan_worker = worker
         worker.scan_finished.connect(self.on_scan_finished)
-        worker.progress_updated.connect(self.progress_bar.setValue)
+        
+        # Use a small wrapper to restore range when progress starts
+        def update_progress(v):
+            if self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(v)
+            
+        worker.progress_updated.connect(update_progress)
         worker.start()
         
     def on_scan_finished(self, results):
         self.cached_results = results
+        
+        # Show loading until it finishes highlighting used files
+        self.status_label.setText("Highlighting used files...")
+        self.progress_bar.setRange(0, 0) # Indeterminate during highlighting
+        QtWidgets.QApplication.processEvents()
+        
         self.update_active_view_data()
+        
         self.status_label.setText(f"Found {len(results)} items in {self.current_path}")
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         # Small delay before hiding progress bar
-        QtCore.QTimer.singleShot(500, self.progress_bar.hide)
+        QtCore.QTimer.singleShot(800, self.progress_bar.hide)
         
     def table_double_clicked(self, index):
         view = self.view_stack.currentWidget()
@@ -2236,6 +2301,11 @@ class Kadatha(QtWidgets.QWidget):
         proxy = view.model()
         
         items_to_delete = []
+        used_items_info = [] # List of (item_name, usage_info)
+        
+        # Get current imported files in Nuke for absolute safety
+        imported_files = self.get_imported_nuke_files()
+        
         for idx in proxy_indexes:
             source_index = proxy.mapToSource(idx)
             if isinstance(view, QtWidgets.QTreeView):
@@ -2243,14 +2313,40 @@ class Kadatha(QtWidgets.QWidget):
                 item = node._data if node else None
             else:
                 item = self.list_model.data(source_index, QtCore.Qt.UserRole)
-            if item:
-                items_to_delete.append(item)
+            
+            if not item:
+                continue
+            items_to_delete.append(item)
+            
+            # Check if this item is used
+            node_name = item.get("imported_node_name")
+            if node_name:
+                used_items_info.append((item.get("name"), f"Used by: {node_name}"))
+            elif item.get("has_imported"):
+                used_items_info.append((item.get("name"), "Folder contains used media"))
+            elif item.get("is_folder") and item.get("path"):
+                # Deeper check for folders just in case scanner hasn't reached children
+                folder_path = os.path.normpath(item["path"]).replace('\\', '/') + "/"
+                for n_path, n_node in imported_files.items():
+                    if n_path.startswith(folder_path):
+                        used_items_info.append((item.get("name"), "Folder contains used media"))
+                        break
                 
         if not items_to_delete: return
         
-        msg = f"Are you sure you want to PERMANENTLY delete {len(items_to_delete)} item(s)?\n\nThis cannot be undone!"
-        res = QtWidgets.QMessageBox.warning(self, "Confirm Delete", msg, 
-                                           QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        if used_items_info:
+            warning_msg = "\n\nCRITICAL WARNING: The following items are currently USED in Nuke:\n"
+            for name, info in used_items_info:
+                warning_msg += f" • {name} ({info})\n"
+            
+            msg = f"PERMANENT DELETE WARNING\n\nYou are about to delete {len(items_to_delete)} item(s).{warning_msg}\nDeleting these will break Read nodes in your current Nuke script.\n\nAre you absolutely sure you want to proceed?"
+            res = QtWidgets.QMessageBox.critical(self, "Confirm Delete - USED MEDIA DETECTED", msg, 
+                                               QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        else:
+            msg = f"Are you sure you want to PERMANENTLY delete {len(items_to_delete)} item(s)?\n\nThis cannot be undone!"
+            res = QtWidgets.QMessageBox.warning(self, "Confirm Delete", msg, 
+                                               QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+
         if res != QtWidgets.QMessageBox.Yes:
             return
             
