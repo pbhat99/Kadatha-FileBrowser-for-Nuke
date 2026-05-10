@@ -54,7 +54,7 @@ Kadatha is a file browser plugin for **Nuke** designed to streamline asset manag
 - Enable delete and rename if required
 - It shows in right click context menu
 
-
+![description]([https://raw.githubusercontent.com/pbhat99/Kadatha-FileBrowser-for-Nuke/refs/heads/main/Preview/Kadatha_Main_Window.png](https://raw.githubusercontent.com/pbhat99/Kadatha-FileBrowser-for-Nuke/refs/heads/main/Preview/Kadatha_Config_Panel.png)) 
 ---
  
 ## Usage
