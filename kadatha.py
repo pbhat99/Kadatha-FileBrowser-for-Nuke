@@ -1,3 +1,6 @@
+# Kadatha - File broswer for nuke
+# version 1.5.0
+
 import os
 import sys
 import threading
@@ -28,10 +31,168 @@ import json
 import scanner
 from scanner import FileScanner
 
-try:
-    import OpenImageIO as oiio
-except ImportError:
-    oiio = None
+import queue
+import hashlib
+import tempfile
+
+def load_config_at_import():
+    config_path = os.path.expanduser("~/.nuke/Kadatha_config.json")
+    old_path = os.path.join(os.path.dirname(__file__), "config.json")
+    found_path = None
+    if os.path.exists(config_path):
+        found_path = config_path
+    elif os.path.exists(old_path):
+        found_path = old_path
+    if found_path:
+        try:
+            with open(found_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def resolve_executable_path(name, config=None):
+    if not config:
+        config = load_config_at_import()
+        
+    # 1. Check config ffmpeg_dir
+    ffmpeg_dir = config.get("ffmpeg_dir")
+    if ffmpeg_dir and os.path.exists(ffmpeg_dir):
+        candidates = [
+            os.path.join(ffmpeg_dir, name),
+            os.path.join(ffmpeg_dir, f"{name}.exe"),
+            os.path.join(ffmpeg_dir, "bin", name),
+            os.path.join(ffmpeg_dir, "bin", f"{name}.exe")
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return os.path.normpath(c).replace('\\', '/')
+
+    # 2. Check env variables
+    env_name_path = os.environ.get(f"{name.upper()}_PATH")
+    if env_name_path and os.path.isfile(env_name_path):
+        return os.path.normpath(env_name_path).replace('\\', '/')
+        
+    for env_key in ["FFMPEG_DIR", "FFMPEG_BIN"]:
+        env_dir = os.environ.get(env_key)
+        if env_dir and os.path.exists(env_dir):
+            candidates = [
+                os.path.join(env_dir, name),
+                os.path.join(env_dir, f"{name}.exe"),
+                os.path.join(env_dir, "bin", name),
+                os.path.join(env_dir, "bin", f"{name}.exe")
+            ]
+            for c in candidates:
+                if os.path.isfile(c):
+                    return os.path.normpath(c).replace('\\', '/')
+
+    # 3. Check system standard PATH
+    resolved = shutil.which(name)
+    if not resolved:
+        return None
+        
+    resolved = os.path.normpath(resolved).replace('\\', '/')
+    # If on Windows and resolved to a .bat/.cmd, try to parse it
+    if os.name == 'nt' and resolved.lower().endswith(('.bat', '.cmd')):
+        try:
+            with open(resolved, 'r', errors='ignore') as f:
+                content = f.read()
+            # Try to find an absolute path ending in .exe
+            import re
+            m = re.search(r'([A-Za-z]:[^\s"]+\.exe|"[A-Za-z]:[^\s"]+\.exe")', content)
+            if m:
+                exe_path = m.group(1).strip('"')
+                if os.path.exists(exe_path):
+                    return exe_path
+        except Exception:
+            pass
+            
+    return resolved
+
+FFMPEG_PATH = None
+FFPROBE_PATH = None
+
+def resolve_ffmpeg_paths(config=None):
+    global FFMPEG_PATH, FFPROBE_PATH
+    FFMPEG_PATH = resolve_executable_path("ffmpeg", config)
+    FFPROBE_PATH = resolve_executable_path("ffprobe", config)
+
+# Initial resolution at import time
+resolve_ffmpeg_paths()
+
+def check_ffmpeg_available():
+    return FFMPEG_PATH is not None
+
+def get_cache_paths(path):
+    temp_dir = tempfile.gettempdir()
+    cache_dir = os.path.join(temp_dir, "Kadatha_Cache", "previews")
+    if not os.path.exists(cache_dir):
+        try:
+            os.makedirs(cache_dir)
+        except Exception:
+            pass
+    h = hashlib.md5(path.encode('utf-8', errors='ignore')).hexdigest()
+    single_path = os.path.join(cache_dir, f"{h}_single.png")
+    strip_path = os.path.join(cache_dir, f"{h}_strip.png")
+    return single_path, strip_path
+
+def is_cache_valid(cache_path, source_mtime):
+    if not os.path.exists(cache_path):
+        return False
+    if not source_mtime:
+        return True
+    try:
+        return os.path.getmtime(cache_path) >= source_mtime
+    except Exception:
+        return False
+
+def get_video_frame_count(path):
+    if not FFPROBE_PATH:
+        return 100
+    try:
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        cmd = [
+            FFPROBE_PATH,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=nb_frames",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            path
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
+        out, _ = proc.communicate()
+        val = out.decode(errors='ignore').strip()
+        if val and val.isdigit():
+            return int(val)
+        
+        # Fallback to duration and r_frame_rate
+        cmd = [
+            FFPROBE_PATH,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "format=duration:stream=r_frame_rate",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            path
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
+        out, _ = proc.communicate()
+        lines = [l.strip() for l in out.decode(errors='ignore').splitlines() if l.strip()]
+        if len(lines) >= 2:
+            duration = float(lines[0])
+            fps_str = lines[1]
+            if '/' in fps_str:
+                num, den = fps_str.split('/')
+                fps = float(num) / float(den)
+            else:
+                fps = float(fps_str)
+            return max(1, int(duration * fps))
+    except Exception as e:
+        print(f"ffprobe error: {e}")
+    return 100 # Default fallback
+
 
 # Initialize Icons
 ICONS_DIR = os.path.join(os.path.dirname(__file__), "Icons")
@@ -429,47 +590,53 @@ class ScanWorker(QtCore.QThread):
 
 
 class PreviewLabel(QtWidgets.QLabel):
-    """Custom label that supports sequence playback on mouse hover."""
+    """Custom label that supports sequence playback on mouse hover using sliced tiled filmstrips."""
     def __init__(self, parent=None):
         super(PreviewLabel, self).__init__(parent)
         self.setMouseTracking(True)
         self.playback_timer = QtCore.QTimer(self)
-        self.playback_timer.timeout.connect(self.play_next_frame)
+        self.playback_timer.timeout.connect(self.play_next_strip_frame)
         self.playback_timer.setInterval(100) # ~10 fps for preview
         
         self.item = None
-        self.first_frame = 0
-        self.last_frame = 0
-        self.current_frame = 0
         self.parent_app = None # Reference to Kadatha app
+        
+        self.strip_pixmap = None
+        self.single_pixmap = None
+        self.cols = 1
+        self.current_strip_frame = 0
+        self.frame_width = 0
 
     def set_item(self, item, app):
         self.item = item
         self.parent_app = app
         self.stop_playback()
-        
-        if item and item.get("is_sequence"):
-            try:
-                frames_str = item.get("frames", "0-0")
-                parts = frames_str.split("-")
-                self.first_frame = int(parts[0])
-                self.last_frame = int(parts[parts.index("-")+1 if "-" in parts else 1]) # Simplified
-                if "-" in frames_str:
-                    split_parts = frames_str.split("-")
-                    self.first_frame = int(split_parts[0])
-                    self.last_frame = int(split_parts[1])
-                else:
-                    self.first_frame = self.last_frame = int(frames_str)
-                
-                self.current_frame = self.first_frame
-            except Exception as e:
-                print(f"Preview Playback Init Error: {e}")
-                self.item = None
+        self.strip_pixmap = None
+        self.single_pixmap = None
+        self.cols = 1
+        self.current_strip_frame = 0
+        self.frame_width = 0
+
+    def set_single_pixmap(self, pixmap):
+        self.single_pixmap = pixmap
+        if pixmap and not pixmap.isNull():
+            aspect = float(pixmap.width()) / float(pixmap.height()) if pixmap.height() > 0 else 1.5
+            calc_width = int(aspect * 200)
+            self.setFixedSize(QtCore.QSize(calc_width, 200))
+            self.setPixmap(pixmap.scaled(calc_width, 200, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))
         else:
-            self.item = None
+            self.setPixmap(QtGui.QPixmap())
+
+    def set_strip_pixmap(self, pixmap, cols):
+        self.strip_pixmap = pixmap
+        self.cols = max(1, cols)
+        if pixmap and not pixmap.isNull():
+            self.frame_width = pixmap.width() // self.cols
+        else:
+            self.frame_width = 0
 
     def enterEvent(self, event):
-        if self.item and self.item.get("is_sequence"):
+        if self.strip_pixmap and not self.strip_pixmap.isNull() and self.cols > 1:
             self.start_playback()
         super(PreviewLabel, self).enterEvent(event)
 
@@ -478,184 +645,238 @@ class PreviewLabel(QtWidgets.QLabel):
         super(PreviewLabel, self).leaveEvent(event)
 
     def start_playback(self):
-        if self.item:
-            self.playback_timer.start()
+        self.current_strip_frame = 0
+        self.playback_timer.start()
 
     def stop_playback(self):
         self.playback_timer.stop()
-        if self.item:
-            self.current_frame = self.first_frame
-            # Reset to first frame preview
-            QtCore.QTimer.singleShot(10, self.update_frame_display)
+        if self.single_pixmap:
+            self.setPixmap(self.single_pixmap.scaled(self.size(), QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))
 
-    def play_next_frame(self):
-        if not self.item:
+    def play_next_strip_frame(self):
+        if not self.strip_pixmap or self.frame_width <= 0:
             return
             
-        self.current_frame += 1
-        if self.current_frame > self.last_frame:
-            self.current_frame = self.first_frame
-            
-        self.update_frame_display()
+        self.current_strip_frame = (self.current_strip_frame + 1) % self.cols
+        
+        # Crop the current frame from the horizontal strip
+        frame_pixmap = self.strip_pixmap.copy(self.current_strip_frame * self.frame_width, 0, self.frame_width, self.strip_pixmap.height())
+        self.setPixmap(frame_pixmap.scaled(self.size(), QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))
 
-    def update_frame_display(self):
-        if not self.item or not self.parent_app:
-            return
-            
-        path = self.item.get("path", "")
-        # Resolve path with current frame
-        img_path = path
-        import re
-        if '%' in img_path:
-            try: img_path = img_path % self.current_frame
-            except: pass
-        elif '#' in img_path:
-            def replace_hash(match):
-                return str(self.current_frame).zfill(len(match.group(0)))
-            img_path = re.sub(r'#+', replace_hash, img_path)
-            
-        # Update via the main app's logic (standard or OIIO)
-        if hasattr(self.parent_app, 'start_preview_job'):
-            self.parent_app.start_preview_job(img_path)
-
-class PreviewWorker(QtCore.QThread):
-    """Background worker for preview generation to prevent UI hangs."""
-    finished = QtCore.Signal(QtGui.QImage, str) # image, path
+class FFmpegPreviewWorker(QtCore.QThread):
+    """Background worker for preview generation using ffmpeg in a persistent thread with dual-stage caching."""
+    finished = QtCore.Signal(QtGui.QImage, str, bool, int) # image, path, is_strip, cols
+    failed = QtCore.Signal(str) # path
     
-    def __init__(self, path, parent=None):
-        super(PreviewWorker, self).__init__(parent)
-        self.path = os.path.normpath(path).replace('\\', '/')
-        self.is_cancelled = False
+    def __init__(self, parent=None):
+        super(FFmpegPreviewWorker, self).__init__(parent)
+        self.queue = queue.Queue()
+        self.active = True
+        self.lock = threading.Lock()
+        self.current_process = None
 
-    def cancel(self):
-        self.is_cancelled = True
+    def request_preview(self, path, is_seq=False, first_frame=0, last_frame=0, seq_path=None, source_mtime=0):
+        # Clear queue of stale requests
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+                
+        # Terminate active ffmpeg process immediately for responsiveness
+        with self.lock:
+            if self.current_process:
+                try:
+                    self.current_process.terminate()
+                except Exception:
+                    pass
+        
+        self.queue.put((path, is_seq, first_frame, last_frame, seq_path, source_mtime))
+
+    def stop(self):
+        self.active = False
+        self.queue.put(None) # Wake up queue from blocking get()
+        with self.lock:
+            if self.current_process:
+                try:
+                    self.current_process.terminate()
+                except Exception:
+                    pass
 
     def run(self):
-        if self.is_cancelled: return
-        
-        # 1. Try OIIO (Fastest for EXR/DPX)
-        q_img = self._try_oiio()
-        if q_img and not q_img.isNull():
-            self.finished.emit(q_img, self.path)
-            return
-
-        if self.is_cancelled: return
-
-        # 2. Try OpenCV (Great for videos/mov and various images)
-        q_img = self._try_opencv()
-        if q_img and not q_img.isNull():
-            self.finished.emit(q_img, self.path)
-            return
-
-        if self.is_cancelled: return
-
-        # 3. Try Nuke Sampling (Small grid fallback for video/mov/exr)
-        q_img = self._try_nuke_sample()
-        if q_img and not q_img.isNull():
-            self.finished.emit(q_img, self.path)
-            return
-            
-    def _try_oiio(self):
-        try:
-            import OpenImageIO as oiio
-            import numpy as np
-            
-            img_input = oiio.ImageInput.open(self.path)
-            if not img_input: return None
-            
-            spec = img_input.spec()
-            w, h, chans = spec.width, spec.height, spec.nchannels
-            
-            # Use smaller of 3 or available channels for RGB
-            read_chans = min(chans, 3)
-            pixels = img_input.read_image(0, 0, 0, read_chans, "uint8")
-            img_input.close()
-            
-            if pixels is None: return None
-            
-            # If it's a numpy array (Nuke 13+ standard)
-            if hasattr(pixels, 'tobytes'):
-                data = pixels.tobytes()
-            else:
-                data = pixels
-
-            return QtGui.QImage(data, w, h, w * read_chans, QtGui.QImage.Format_RGB888)
-        except Exception:
-            return None
-
-    def _try_opencv(self):
-        try:
-            import subprocess
-            import tempfile
-            import os
-            
-            # Temporary file to store the extracted frame
-            fd, temp_img_path = tempfile.mkstemp(suffix=".jpg")
-            os.close(fd)
-            
-            py_script = f"""
-try:
-    import cv2
-    import sys
-    path = r'''{self.path}'''
-    out_path = r'''{temp_img_path}'''
-
-    cap = cv2.VideoCapture(path)
-    if cap.isOpened():
-        ret, frame = cap.read()
-        cap.release()
-        if ret and frame is not None:
-            cv2.imwrite(out_path, frame)
-            sys.exit(0)
-    
-    frame = cv2.imread(path)
-    if frame is not None:
-        cv2.imwrite(out_path, frame)
-        sys.exit(0)
-        
-    sys.exit(1)
-except Exception:
-    sys.exit(1)
-"""
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        while self.active:
+            try:
+                job = self.queue.get()
+                if job is None or not self.active:
+                    break
                 
-            process = subprocess.Popen(['python', '-c', py_script], 
-                                       stdout=subprocess.PIPE, 
-                                       stderr=subprocess.PIPE,
-                                       startupinfo=startupinfo)
-            process.communicate()
-            
-            q_img = None
-            if process.returncode == 0 and os.path.exists(temp_img_path) and os.path.getsize(temp_img_path) > 0:
-                img_reader = QtGui.QImageReader(temp_img_path)
-                q_img = img_reader.read()
-                if not q_img.isNull():
-                    q_img = q_img.copy()
-            
-            if os.path.exists(temp_img_path):
-                os.remove(temp_img_path)
+                path, is_seq, first_frame, last_frame, seq_path, source_mtime = job
                 
-            return q_img if (q_img and not q_img.isNull()) else None
-        except Exception as e:
-            print("OpenCV subprocess error:", e)
-            return None
-
-    def _try_nuke_sample(self):
-        """Ultra-fast 32x32 nuke.sample fallback."""
-        if not nuke: return None
-        
-        try:
-            # We must use executeInMainThread to be safe with nuke commands
-            # but that defeats the purpose of the thread if we do it in a loop.
-            # Instead, we'll suggest a minimal image if nuke is present and OIIO fails.
-            # For now, let's keep it simple: if nuke is present, we only do this once
-            # for the first frame.
-            return None # Placeholder for now, we'll stick to OIIO/QPixmap primarily
-        except:
-            return None
+                norm_path = os.path.normpath(path).replace('\\', '/')
+                
+                # Cache checking based on original path/pattern
+                cache_key_path = seq_path if seq_path else path
+                single_cache, strip_cache = get_cache_paths(cache_key_path)
+                
+                # Check video extension
+                ext = os.path.splitext(norm_path)[1].lower()
+                is_video = ext in [".mov", ".mp4", ".mkv", ".avi", ".webm", ".m4v"]
+                
+                # ----------------- STAGE 1: Extract Single Frame (Frame 2) -----------------
+                loaded_single = False
+                q_single = None
+                
+                if is_cache_valid(single_cache, source_mtime):
+                    q_single = QtGui.QImage(single_cache)
+                    if q_single and not q_single.isNull():
+                        loaded_single = True
+                        
+                if not loaded_single:
+                    # Not cached or invalid: extract and save to single_cache
+                    if is_video:
+                        cmd = [
+                            FFMPEG_PATH,
+                            "-y",
+                            "-i", norm_path,
+                            "-vf", "select=eq(n\,1),scale=-2:200",
+                            "-vframes", "1",
+                            single_cache
+                        ]
+                    else:
+                        cmd = [
+                            FFMPEG_PATH,
+                            "-y",
+                            "-i", norm_path,
+                            "-vframes", "1",
+                            "-vf", "scale=-2:200",
+                            single_cache
+                        ]
+                        
+                    startupinfo = None
+                    if os.name == 'nt':
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        
+                    with self.lock:
+                        if not self.active:
+                            break
+                        self.current_process = subprocess.Popen(
+                            cmd,
+                            startupinfo=startupinfo
+                        )
+                        
+                    self.current_process.wait()
+                    with self.lock:
+                        self.current_process = None
+                        
+                    # Fallback for video frame eq(n, 1) in case it failed
+                    if is_video and not os.path.exists(single_cache):
+                        cmd_fallback = [
+                            FFMPEG_PATH,
+                            "-y",
+                            "-i", norm_path,
+                            "-vframes", "1",
+                            "-vf", "scale=-2:200",
+                            single_cache
+                        ]
+                        with self.lock:
+                            if not self.active:
+                                break
+                            self.current_process = subprocess.Popen(
+                                cmd_fallback,
+                                startupinfo=startupinfo
+                            )
+                        self.current_process.wait()
+                        with self.lock:
+                            self.current_process = None
+                            
+                    if os.path.exists(single_cache):
+                        q_single = QtGui.QImage(single_cache)
+                        if q_single and not q_single.isNull():
+                            loaded_single = True
+                            
+                if loaded_single and q_single:
+                    self.finished.emit(q_single, path, False, 1) # is_strip = False, cols = 1
+                else:
+                    self.failed.emit(path)
+                    continue
+                    
+                # ----------------- STAGE 2: Extract Contact Strip (Filmstrip) -----------------
+                if not self.active:
+                    break
+                    
+                # Calculate cols
+                cols = 0
+                if is_seq:
+                    num_frames = last_frame - first_frame + 1
+                    cols = (num_frames + 9) // 10
+                elif is_video:
+                    total_frames = get_video_frame_count(norm_path)
+                    cols = (total_frames + 9) // 10
+                    cols = min(cols, 50) # limit to 50 columns to prevent giant frames
+                    
+                if cols > 0:
+                    loaded_strip = False
+                    q_strip = None
+                    
+                    if is_cache_valid(strip_cache, source_mtime):
+                        q_strip = QtGui.QImage(strip_cache)
+                        if q_strip and not q_strip.isNull():
+                            loaded_strip = True
+                            
+                    if not loaded_strip:
+                        startupinfo = None
+                        if os.name == 'nt':
+                            startupinfo = subprocess.STARTUPINFO()
+                            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                            
+                        if is_seq and seq_path:
+                            norm_seq_path = os.path.normpath(seq_path).replace('\\', '/')
+                            strip_cmd = [
+                                FFMPEG_PATH,
+                                "-y",
+                                "-start_number", str(first_frame),
+                                "-i", norm_seq_path,
+                                "-vf", f"select=not(mod(n\,10)),scale=-2:100,tile={cols}x1",
+                                strip_cache
+                            ]
+                        elif is_video:
+                            strip_cmd = [
+                                FFMPEG_PATH,
+                                "-y",
+                                "-i", norm_path,
+                                "-vf", f"select=not(mod(n\,10)),scale=-2:100,tile={cols}x1",
+                                "-vframes", str(cols * 10),
+                                strip_cache
+                            ]
+                        else:
+                            strip_cmd = None
+                            
+                        if strip_cmd:
+                            with self.lock:
+                                if not self.active:
+                                    break
+                                self.current_process = subprocess.Popen(
+                                    strip_cmd,
+                                    startupinfo=startupinfo
+                                )
+                            self.current_process.wait()
+                            with self.lock:
+                                self.current_process = None
+                                
+                        if os.path.exists(strip_cache):
+                            q_strip = QtGui.QImage(strip_cache)
+                            if q_strip and not q_strip.isNull():
+                                loaded_strip = True
+                                
+                    if loaded_strip and q_strip:
+                        self.finished.emit(q_strip, path, True, cols) # is_strip = True, cols
+            except Exception as e:
+                print(f"FFmpegPreviewWorker thread exception: {e}")
+                try:
+                    self.failed.emit(path)
+                except:
+                    pass
 
 class TypeFilterProxyModel(QtCore.QSortFilterProxyModel):
     def __init__(self, parent=None):
@@ -664,6 +885,43 @@ class TypeFilterProxyModel(QtCore.QSortFilterProxyModel):
         self.show_folders = True
         self.or_groups = []
         self.negative_terms = []
+        self.sort_used_first = False
+
+    def lessThan(self, left, right):
+        model = self.sourceModel()
+        if not model:
+            return super(TypeFilterProxyModel, self).lessThan(left, right)
+            
+        if self.sort_used_first:
+            left_item = model.data(left, QtCore.Qt.UserRole)
+            right_item = model.data(right, QtCore.Qt.UserRole)
+            if left_item and right_item:
+                left_hl = bool(left_item.get("imported_node_name") or left_item.get("has_imported"))
+                right_hl = bool(right_item.get("imported_node_name") or right_item.get("has_imported"))
+                if left_hl != right_hl:
+                    is_asc = (self.sortOrder() == QtCore.Qt.AscendingOrder)
+                    if left_hl:
+                        return is_asc
+                    else:
+                        return not is_asc
+                        
+        if left.column() == 0:
+            left_data = model.data(left, QtCore.Qt.DisplayRole)
+            right_data = model.data(right, QtCore.Qt.DisplayRole)
+            
+            if isinstance(left_data, str) and isinstance(right_data, str):
+                import re
+                def pad_numbers(match):
+                    return f"{int(match.group(1)):010d}"
+                
+                try:
+                    left_key = re.sub(r'(\d+)', pad_numbers, left_data.lower())
+                    right_key = re.sub(r'(\d+)', pad_numbers, right_data.lower())
+                    return left_key < right_key
+                except:
+                    pass
+
+        return super(TypeFilterProxyModel, self).lessThan(left, right)
 
     def set_search_text(self, text):
         self.or_groups = [] # List of lists (AND groups)
@@ -796,7 +1054,7 @@ class KadathaConfigDialog(QtWidgets.QDialog):
         form.addRow("Single Files:", self.non_seq_edit)
         
         self.depth_spin = QtWidgets.QSpinBox()
-        self.depth_spin.setRange(0, 10)
+        self.depth_spin.setRange(0, 25)
         self.depth_spin.setValue(self.config.get("max_depth", 0))
         form.addRow("Default Depth:", self.depth_spin)
         
@@ -818,6 +1076,24 @@ class KadathaConfigDialog(QtWidgets.QDialog):
         self.regex_edit = QtWidgets.QLineEdit(str(self.config.get("version_regex", "")))
         form.addRow("Version Regex:", self.regex_edit)
         
+        # FFmpeg Directory Browse Option
+        ffmpeg_widget = QtWidgets.QWidget()
+        ffmpeg_hl = QtWidgets.QHBoxLayout(ffmpeg_widget)
+        ffmpeg_hl.setContentsMargins(0, 0, 0, 0)
+        ffmpeg_hl.setSpacing(5)
+        
+        self.ffmpeg_dir_edit = QtWidgets.QLineEdit(str(self.config.get("ffmpeg_dir", "")))
+        self.ffmpeg_dir_edit.setPlaceholderText("Path to FFmpeg directory (e.g. C:/ffmpeg/bin)")
+        self.ffmpeg_dir_edit.setToolTip("Custom path to FFmpeg binary folder (overrides default search)")
+        
+        self.ffmpeg_browse_btn = QtWidgets.QPushButton("Browse...")
+        self.ffmpeg_browse_btn.clicked.connect(self.browse_ffmpeg_dir)
+        self.ffmpeg_browse_btn.setStyleSheet("padding: 4px 10px; background-color: #2b2b2b; border: 1px solid #00A3FF; border-radius: 4px;")
+        
+        ffmpeg_hl.addWidget(self.ffmpeg_dir_edit)
+        ffmpeg_hl.addWidget(self.ffmpeg_browse_btn)
+        form.addRow("FFmpeg Directory:", ffmpeg_widget)
+        
         self.enable_edit_cb = QtWidgets.QCheckBox("Enable Delete and Rename in Context Menu")
         self.enable_edit_cb.setChecked(self.config.get("enable_delete_rename", False))
         self.enable_edit_cb.setToolTip("Safety: If enabled, you can rename and delete files/folders from the right-click menu.")
@@ -837,6 +1113,18 @@ class KadathaConfigDialog(QtWidgets.QDialog):
         self.reset_btn.clicked.connect(self.on_reset_clicked)
         
         layout.addWidget(self.btn_box)
+
+    def browse_ffmpeg_dir(self):
+        curr_dir = self.ffmpeg_dir_edit.text().strip()
+        if not curr_dir or not os.path.exists(curr_dir):
+            curr_dir = os.path.expanduser("~")
+        
+        selected_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select FFmpeg Folder", curr_dir, 
+            QtWidgets.QFileDialog.ShowDirsOnly | QtWidgets.QFileDialog.DontResolveSymlinks
+        )
+        if selected_dir:
+            self.ffmpeg_dir_edit.setText(selected_dir.replace('\\', '/'))
 
     def on_reset_clicked(self):
         msg = "Are you sure you want to perform a factory reset?\n\nThis will permanently delete:\n- Configuration (JSON)\n- Preferences (Favorites, History, Search History, Layouts)\n\nThe tool will immediately revert to factory defaults."
@@ -859,7 +1147,8 @@ class KadathaConfigDialog(QtWidgets.QDialog):
             "history_limit": self.history_spin.value(),
             "favorites_limit": self.fav_limit_spin.value(),
             "version_regex": self.regex_edit.text(),
-            "enable_delete_rename": self.enable_edit_cb.isChecked()
+            "enable_delete_rename": self.enable_edit_cb.isChecked(),
+            "ffmpeg_dir": self.ffmpeg_dir_edit.text().strip()
         }
         return new_config
 
@@ -918,9 +1207,12 @@ class Kadatha(QtWidgets.QWidget):
         
         # Scanner initialization
         self.config = self.load_config()
+        resolve_ffmpeg_paths(self.config)
         self.scanner = FileScanner(self.config)
         self.scan_worker = None
         self.cached_results = []
+        self.ffmpeg_available = check_ffmpeg_available()
+        self.ffmpeg_worker = None
         self.load_user_settings()
         
         # Determine current path from settings or Home
@@ -954,6 +1246,7 @@ class Kadatha(QtWidgets.QWidget):
             
         # Load layout - store in temporary dict for setup_ui to use
         self.saved_splitter_sizes = settings.value("splitter_sizes")
+        self.saved_left_splitter_sizes = settings.value("left_splitter_sizes")
         self.saved_sort_column = settings.value("sort_column")
         self.saved_sort_order = settings.value("sort_order")
         self.saved_list_widths = settings.value("list_widths")
@@ -964,6 +1257,7 @@ class Kadatha(QtWidgets.QWidget):
         self.saved_preview_visible = settings.value("preview_visible", "true") == "true"
         self.saved_sidebar_visible = settings.value("sidebar_visible", "true") == "true"
         self.saved_bundle_sequences = settings.value("bundle_sequences", "true") == "true"
+        self.saved_sort_used_first = settings.value("sort_used_first", "true") == "true"
         
         history = settings.value("history", [])
         if isinstance(history, str):
@@ -987,6 +1281,8 @@ class Kadatha(QtWidgets.QWidget):
         settings = self.get_settings_obj()
         settings.setValue("favorites", self.favorites)
         settings.setValue("splitter_sizes", self.splitter.sizes())
+        if hasattr(self, 'left_splitter'):
+            settings.setValue("left_splitter_sizes", self.left_splitter.sizes())
         settings.setValue("view_index", self.view_stack.currentIndex())
         settings.setValue("last_path", self.current_path)
         settings.setValue("history", self.history)
@@ -994,6 +1290,7 @@ class Kadatha(QtWidgets.QWidget):
         settings.setValue("preview_visible", self.preview_btn.isChecked())
         settings.setValue("sidebar_visible", self.sidebar_btn.isChecked())
         settings.setValue("bundle_sequences", self.filter_sequences_cb.isChecked())
+        settings.setValue("sort_used_first", self.sort_used_first_cb.isChecked())
         
         view = self.view_stack.currentWidget()
         header = view.header() if hasattr(view, 'header') else view.horizontalHeader()
@@ -1017,10 +1314,16 @@ class Kadatha(QtWidgets.QWidget):
             
     def hideEvent(self, event):
         self.save_user_settings()
+        if hasattr(self, 'ffmpeg_worker') and self.ffmpeg_worker and self.ffmpeg_worker.isRunning():
+            self.ffmpeg_worker.stop()
+            self.ffmpeg_worker.wait()
         super(Kadatha, self).hideEvent(event)
         
     def closeEvent(self, event):
         self.save_user_settings()
+        if hasattr(self, 'ffmpeg_worker') and self.ffmpeg_worker and self.ffmpeg_worker.isRunning():
+            self.ffmpeg_worker.stop()
+            self.ffmpeg_worker.wait()
         super(Kadatha, self).closeEvent(event)
             
     def rebuild_favorites_ui(self):
@@ -1060,7 +1363,9 @@ class Kadatha(QtWidgets.QWidget):
         if not index.isValid():
             return
             
-        path = self.tree_model.filePath(index)
+        # Map proxy index back to source model
+        source_index = self.sidebar_proxy.mapToSource(index)
+        path = self.tree_model.filePath(source_index)
         if not os.path.isdir(path):
             path = os.path.dirname(path)
             
@@ -1106,7 +1411,8 @@ class Kadatha(QtWidgets.QWidget):
             "favorites_limit": 20,
             "bundle_sequences": True,
             "enable_delete_rename": False,
-            "non_sequence_extensions": [".mov", ".mp4", ".abc", ".fbx", ".obj", ".wav", ".mp3"]
+            "non_sequence_extensions": [".mov", ".mp4", ".abc", ".fbx", ".obj", ".wav", ".mp3"],
+            "ffmpeg_dir": ""
         }
         
         # Try new path first, then old path
@@ -1228,6 +1534,12 @@ class Kadatha(QtWidgets.QWidget):
         self.filter_sequences_cb.stateChanged.connect(self.sequence_toggle_changed)
         filter_bar.addWidget(self.filter_sequences_cb)
         
+        self.sort_used_first_cb = QtWidgets.QCheckBox("Used First")
+        self.sort_used_first_cb.setChecked(self.saved_sort_used_first if hasattr(self, 'saved_sort_used_first') else True)
+        self.sort_used_first_cb.setToolTip("Pin highlighted (used) items to the top of the list")
+        self.sort_used_first_cb.stateChanged.connect(self.update_filters)
+        filter_bar.addWidget(self.sort_used_first_cb)
+        
         # Initialize scanner's bundle_sequences state
         self.scanner.bundle_sequences = self.filter_sequences_cb.isChecked()
         
@@ -1260,8 +1572,15 @@ class Kadatha(QtWidgets.QWidget):
         self.tree_model.setFilter(QtCore.QDir.NoDotAndDotDot | QtCore.QDir.AllDirs)
         self.tree_model.setRootPath("")
         
+        self.sidebar_proxy = QtCore.QSortFilterProxyModel(self)
+        self.sidebar_proxy.setSourceModel(self.tree_model)
+        self.sidebar_proxy.setSortCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        self.sidebar_proxy.setDynamicSortFilter(True)
+        
         self.tree_view = QtWidgets.QTreeView()
-        self.tree_view.setModel(self.tree_model)
+        self.tree_view.setModel(self.sidebar_proxy)
+        self.tree_view.setSortingEnabled(True)
+        self.tree_view.sortByColumn(0, QtCore.Qt.AscendingOrder)
         self.tree_view.header().hide()
         self.tree_view.setIconSize(QtCore.QSize(0, 0)) #sidebar icons
         self.tree_view.setToolTip("Browse local directory structure")
@@ -1271,32 +1590,42 @@ class Kadatha(QtWidgets.QWidget):
         self.tree_view.clicked.connect(self.tree_clicked)
         self.tree_view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.tree_context_menu)
-        self.left_layout.addWidget(self.tree_view, 2) # Giving it more stretch
         
         # --- Preview Window ---
         self.preview_container = QtWidgets.QFrame()
         self.preview_container.setFrameShape(QtWidgets.QFrame.StyledPanel)
         self.preview_container.setStyleSheet("background-color: #222; border-radius: 4px; border: 1px solid #333;")
         self.preview_layout = QtWidgets.QVBoxLayout(self.preview_container)
-        self.preview_layout.setContentsMargins(8, 8, 8, 8)
-        self.preview_layout.setSpacing(6)
+        self.preview_layout.setContentsMargins(6, 6, 6, 6)
+        self.preview_layout.setSpacing(3)
         
         preview_header = QtWidgets.QLabel("") # Removed header text
         preview_header.setFixedSize(QtCore.QSize(0, 0)) # Effectively hide
         
         self.preview_img = PreviewLabel()
-        self.preview_img.setFixedSize(QtCore.QSize(230, 140))
+        self.preview_img.setFixedHeight(200)
         self.preview_img.setAlignment(QtCore.Qt.AlignCenter)
         self.preview_img.setStyleSheet("background-color: #111; border: 1px solid #222;")
         self.preview_img.setToolTip("Hover to play sequence (if single selection)")
         self.preview_layout.addWidget(self.preview_img, alignment=QtCore.Qt.AlignCenter)
         
         self.preview_info = QtWidgets.QLabel("Select a file to see details")
-        self.preview_info.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.preview_info.setStyleSheet("color: #aaa; font-size: 9px; line-height: 12px;")
         self.preview_info.setWordWrap(True)
         self.preview_layout.addWidget(self.preview_info)
         
-        self.left_layout.addWidget(self.preview_container, 1)
+        # Vertical Splitter to allow vertical resizing within left sidebar
+        self.left_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.left_splitter.setHandleWidth(4)
+        self.left_splitter.setStyleSheet("QSplitter::handle { background-color: #333; }")
+        self.left_splitter.addWidget(self.tree_view)
+        self.left_splitter.addWidget(self.preview_container)
+        self.left_splitter.setStretchFactor(0, 2) # tree_view
+        self.left_splitter.setStretchFactor(1, 1) # preview_container
+        
+        self.left_splitter.splitterMoved.connect(lambda x, y: self.save_user_settings())
+        
+        self.left_layout.addWidget(self.left_splitter)
         self.splitter.addWidget(self.left_panel)
         
         # --- Right Panel (Stacked) ---
@@ -1397,6 +1726,12 @@ class Kadatha(QtWidgets.QWidget):
             else:
                 self.splitter.setSizes([250, 600])
                 
+            saved_left_sizes = self.saved_left_splitter_sizes
+            if saved_left_sizes:
+                self.left_splitter.setSizes([int(s) for s in saved_left_sizes])
+            else:
+                self.left_splitter.setSizes([400, 300])
+                
             self.preview_btn.setChecked(bool(self.saved_preview_visible))
             self.preview_container.setVisible(bool(self.saved_preview_visible))
             self.sidebar_btn.setChecked(bool(self.saved_sidebar_visible))
@@ -1484,7 +1819,7 @@ class Kadatha(QtWidgets.QWidget):
         
         # Progress Bar at the very bottom
         self.progress_bar = QtWidgets.QProgressBar()
-        self.progress_bar.setFixedHeight(2)
+        self.progress_bar.setFixedHeight(5)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -1506,6 +1841,7 @@ class Kadatha(QtWidgets.QWidget):
         
         # Initialize
         self.set_path(self.current_path)
+        self.manage_ffmpeg_worker_state()
         
     def open_config(self):
         dialog = KadathaConfigDialog(self.config, self)
@@ -1514,6 +1850,9 @@ class Kadatha(QtWidgets.QWidget):
         if res == QtWidgets.QDialog.Accepted:
             new_config = dialog.get_config()
             self.config = new_config
+            resolve_ffmpeg_paths(self.config)
+            self.ffmpeg_available = check_ffmpeg_available()
+            self.manage_ffmpeg_worker_state()
             self.scanner = FileScanner(self.config) # Update scanner with new config
             
             # Save to file in .nuke
@@ -1556,6 +1895,9 @@ class Kadatha(QtWidgets.QWidget):
         self.search_history = []
         self.current_path = os.path.expanduser("~")
         self.config = self.load_config() # Reload default hardcoded config
+        resolve_ffmpeg_paths(self.config)
+        self.ffmpeg_available = check_ffmpeg_available()
+        self.manage_ffmpeg_worker_state()
         self.scanner = FileScanner(self.config)
         
         # 4. Update UI to match empty state
@@ -1621,30 +1963,62 @@ class Kadatha(QtWidgets.QWidget):
             self.set_path(path)
             
     def path_changed(self):
-        new_path = self.path_edit.currentText()
+        new_path = os.path.normpath(self.path_edit.currentText())
+        if new_path == self.current_path:
+            return
         if os.path.exists(new_path) and os.path.isdir(new_path):
             self.set_path(new_path)
             
     def on_path_selected(self, index):
-        path = self.path_edit.itemText(index)
+        path = os.path.normpath(self.path_edit.itemText(index))
+        if path == self.current_path:
+            return
         if os.path.exists(path) and os.path.isdir(path):
             self.set_path(path)
             
     def tree_clicked(self, index):
-        path = self.tree_model.filePath(index)
+        source_index = self.sidebar_proxy.mapToSource(index)
+        path = os.path.normpath(self.tree_model.filePath(source_index))
+        if path == self.current_path:
+            return
         if os.path.isdir(path):
             self.set_path(path)
             
     def depth_changed(self, value):
+        if self.config.get("max_depth") == value:
+            return
+        self.config["max_depth"] = value
         self.scanner.max_depth = value
-        self.refresh()
         
+        # Save to file
+        try:
+            config_path = self.get_config_path()
+            nuke_dir = os.path.dirname(config_path)
+            if not os.path.exists(nuke_dir):
+                os.makedirs(nuke_dir)
+            import json
+            with open(config_path, 'w') as f:
+                json.dump(self.config, f, indent=4)
+        except Exception as e:
+            print(f"Failed to save depth config: {e}")
     def toggle_sidebar(self):
         visible = self.sidebar_btn.isChecked()
         self.tree_view.setVisible(visible)
         if hasattr(self, 'preview_container'):
             # Only hide the whole left panel if both are hidden
             self.left_panel.setVisible(visible or self.preview_btn.isChecked())
+            
+        if visible and hasattr(self, 'tree_model'):
+            # Force refresh of the sidebar directory tree only
+            self.tree_model.setRootPath("")
+            self.tree_model.setRootPath(self.current_path)
+            
+            idx = self.tree_model.index(self.current_path)
+            if idx.isValid() and hasattr(self, 'sidebar_proxy'):
+                proxy_idx = self.sidebar_proxy.mapFromSource(idx)
+                self.tree_view.setCurrentIndex(proxy_idx)
+                self.tree_view.scrollTo(proxy_idx)
+                
         self.save_user_settings()
 
     def toggle_preview(self):
@@ -1652,9 +2026,32 @@ class Kadatha(QtWidgets.QWidget):
         self.preview_container.setVisible(visible)
         # Only hide the whole left panel if both are hidden
         self.left_panel.setVisible(visible or self.sidebar_btn.isChecked())
+        
+        self.manage_ffmpeg_worker_state()
+        
         if visible:
             self.selection_changed() # Force update when showing
         self.save_user_settings()
+
+    def manage_ffmpeg_worker_state(self):
+        if not self.ffmpeg_available:
+            if self.ffmpeg_worker is not None and self.ffmpeg_worker.isRunning():
+                self.ffmpeg_worker.stop()
+                self.ffmpeg_worker.wait()
+            return
+            
+        is_preview_visible = self.preview_btn.isChecked()
+        if is_preview_visible:
+            if self.ffmpeg_worker is None:
+                self.ffmpeg_worker = FFmpegPreviewWorker(self)
+                self.ffmpeg_worker.finished.connect(self.on_ffmpeg_preview_finished)
+                self.ffmpeg_worker.failed.connect(self.on_ffmpeg_failed)
+            if not self.ffmpeg_worker.isRunning():
+                self.ffmpeg_worker.start()
+        else:
+            if self.ffmpeg_worker is not None and self.ffmpeg_worker.isRunning():
+                self.ffmpeg_worker.stop()
+                self.ffmpeg_worker.wait()
 
     def selection_changed(self, *args):
         if not hasattr(self, 'preview_btn') or not self.preview_btn.isChecked():
@@ -1697,12 +2094,26 @@ class Kadatha(QtWidgets.QWidget):
         ext = item.get("extension", "").lower()
         is_seq = item.get("is_sequence", False)
         
-        # 1. Update Metadata
-        info_text = f"<b>Name:</b> {name}<br>"
-        info_text += f"<b>Type:</b> {'Sequence' if is_seq else ('Folder' if item.get('is_folder') else 'File')}<br>"
-        if size: info_text += f"<b>Size:</b> {size}<br>"
-        if owner: info_text += f"<b>Owner:</b> {owner}<br>"
-        if is_seq: info_text += f"<b>Frames:</b> {item.get('frames', '')}<br>"
+        # 1. Update Metadata (Condensed Layout)
+        is_folder = item.get("is_folder", False)
+        info_text = f"<b>{name}</b><br/>"
+        details = []
+        if is_seq:
+            details.append("Sequence")
+            frames = item.get("frames", "")
+            if frames:
+                details.append(f"Frames: {frames}")
+        elif is_folder:
+            details.append("Folder")
+        else:
+            details.append("File")
+            
+        if size:
+            details.append(size)
+        if owner:
+            details.append(f"Owner: {owner}")
+            
+        info_text += " • ".join(details)
         
         self.preview_info.setText(info_text)
         
@@ -1717,58 +2128,81 @@ class Kadatha(QtWidgets.QWidget):
         img_path = path
         if is_seq:
             try:
-                # Resolve sequence to first frame path
-                frames_str = item.get("frames", "0-0")
-                first_frame = int(frames_str.split("-")[0])
+                # Resolve sequence to frame 2 (second frame in sequence)
+                first_frame = item.get("first_frame", 0)
+                last_frame = item.get("last_frame", 0)
+                target_frame = first_frame + 1 if last_frame > first_frame else first_frame
                 
-                img_path = path
                 if '%' in img_path:
-                    try: img_path = img_path % first_frame
+                    try: img_path = img_path % target_frame
                     except: pass
                 elif '#' in img_path:
                     import re
                     def replace_hash(match):
-                        return str(first_frame).zfill(len(match.group(0)))
+                        return str(target_frame).zfill(len(match.group(0)))
                     img_path = re.sub(r'#+', replace_hash, img_path)
             except:
                 pass
         
         # Start the background preview job
-        self.start_preview_job(img_path)
+        self.start_preview_job(img_path, item)
 
-    def start_preview_job(self, path):
-        # Cancel current job
-        if hasattr(self, '_preview_worker') and self._preview_worker.isRunning():
-            self._preview_worker.cancel()
-            self._preview_worker.wait()
-
-        # Check for standard QPixmap support first (best for JPG/PNG)
+    def start_preview_job(self, path, item=None):
+        # Absolutely prevent trying to generate previews for folders/directories
+        if (item and item.get("is_folder")) or (path and os.path.isdir(path)):
+            self.preview_img.setPixmap(FOLDER_ICON.pixmap(64, 64))
+            return
+            
+        # Check for standard QPixmap support first (best for JPG/PNG single files)
+        is_seq = item.get("is_sequence", False) if item else False
         img_ext = os.path.splitext(path)[1].lower()
-        if img_ext in [".jpg", ".jpeg", ".png", ".bmp", ".gif"]:
+        if not is_seq and img_ext in [".jpg", ".jpeg", ".png", ".bmp", ".gif"]:
             pixmap = QtGui.QPixmap(path)
             if not pixmap.isNull():
-                self.set_preview_pixmap(pixmap)
+                self.preview_img.set_single_pixmap(pixmap)
                 return
 
-        # Start background worker for OIIO/Pro formats
-        self._preview_worker = PreviewWorker(path, self)
-        self._preview_worker.finished.connect(self.on_preview_finished)
-        self._preview_worker.start()
+        # If ffmpeg is available and its pane is active, request background preview
+        if self.ffmpeg_available and self.preview_btn.isChecked() and hasattr(self, 'ffmpeg_worker') and self.ffmpeg_worker:
+            is_seq = item.get("is_sequence", False) if item else False
+            first_frame = item.get("first_frame", 0) if item else 0
+            last_frame = item.get("last_frame", 0) if item else 0
+            seq_path = item.get("path", None) if item else None
+            try:
+                source_mtime = item.get("date", 0) if item else os.path.getmtime(path)
+            except Exception:
+                source_mtime = 0
+            self.ffmpeg_worker.request_preview(path, is_seq, first_frame, last_frame, seq_path, source_mtime)
+        else:
+            # Simple fallback to direct QPixmap loading
+            pixmap = QtGui.QPixmap(path)
+            if not pixmap.isNull():
+                self.preview_img.set_single_pixmap(pixmap)
+            else:
+                self.preview_img.setPixmap(FILE_ICON.pixmap(64, 64))
 
-    def on_preview_finished(self, q_img, path):
-        # Ensure it's still for the current item
+    def on_ffmpeg_preview_finished(self, q_img, path, is_strip, cols):
         if q_img and not q_img.isNull():
-            self.set_preview_pixmap(QtGui.QPixmap.fromImage(q_img))
+            pixmap = QtGui.QPixmap.fromImage(q_img)
+            if is_strip:
+                self.preview_img.set_strip_pixmap(pixmap, cols)
+            else:
+                self.preview_img.set_single_pixmap(pixmap)
+        else:
+            self.on_ffmpeg_failed(path)
+
+    def on_ffmpeg_failed(self, path):
+        # Fallback when ffmpeg fails or is unavailable
+        pixmap = QtGui.QPixmap(path)
+        if not pixmap.isNull():
+            self.preview_img.set_single_pixmap(pixmap)
         else:
             self.preview_img.setPixmap(FILE_ICON.pixmap(64, 64))
 
     def set_preview_pixmap(self, pixmap):
         if not pixmap or pixmap.isNull():
             return
-        scaled_pix = pixmap.scaled(self.preview_img.size(), 
-                                 QtCore.Qt.KeepAspectRatio, 
-                                 QtCore.Qt.SmoothTransformation)
-        self.preview_img.setPixmap(scaled_pix)
+        self.preview_img.set_single_pixmap(pixmap)
 
 
 
@@ -1900,10 +2334,11 @@ class Kadatha(QtWidgets.QWidget):
         proxy.set_search_text(search_text)
         proxy.show_files = show_files
         proxy.show_folders = show_folders
+        proxy.sort_used_first = self.sort_used_first_cb.isChecked()
         if hasattr(proxy, 'setRecursiveFilteringEnabled'):
             # Multi-level filtering needed for Tree (idx 1) and Group (idx 2)
             proxy.setRecursiveFilteringEnabled(idx in [1, 2]) 
-        proxy.invalidateFilter()
+        proxy.invalidate()
         
         if search_text:
             self.search_edit.lineEdit().setStyleSheet("background-color: #5a3b00; color: #ffffff;")
@@ -1917,7 +2352,7 @@ class Kadatha(QtWidgets.QWidget):
             self.filter_files_cb.setStyleSheet("color: #ff8800; font-weight: bold;")
         else:
             self.filter_files_cb.setStyleSheet("")
-            
+
         if show_folders:
             self.filter_folders_cb.setStyleSheet("color: #ff8800; font-weight: bold;")
         else:
@@ -1927,6 +2362,11 @@ class Kadatha(QtWidgets.QWidget):
             self.filter_sequences_cb.setStyleSheet("color: #ff8800; font-weight: bold;")
         else:
             self.filter_sequences_cb.setStyleSheet("")
+            
+        if self.sort_used_first_cb.isChecked():
+            self.sort_used_first_cb.setStyleSheet("color: #ff8800; font-weight: bold;")
+        else:
+            self.sort_used_first_cb.setStyleSheet("")
 
     def store_search_history(self):
         text = self.search_edit.currentText().strip()
@@ -1979,8 +2419,9 @@ class Kadatha(QtWidgets.QWidget):
         
         idx = self.tree_model.index(self.current_path)
         if idx.isValid():
-            self.tree_view.setCurrentIndex(idx)
-            self.tree_view.scrollTo(idx)
+            proxy_idx = self.sidebar_proxy.mapFromSource(idx)
+            self.tree_view.setCurrentIndex(proxy_idx)
+            self.tree_view.scrollTo(proxy_idx)
         
         self.refresh()
         
@@ -2140,7 +2581,7 @@ class Kadatha(QtWidgets.QWidget):
                 path = item.get("path", "")
                 self.open_in_explorer(path)
                 
-        elif action == fav_action:
+        elif fav_action and action == fav_action:
             source_index = proxy.mapToSource(indexes[0])
             if isinstance(view, QtWidgets.QTreeView):
                 node = source_index.internalPointer()
@@ -2265,20 +2706,37 @@ class Kadatha(QtWidgets.QWidget):
                     new_ext = old_ext
 
                 # Find and rename files
-                count = 0
+                files_to_rename = []
                 for f in os.listdir(parent_dir):
                     if f.startswith(old_prefix) and f.endswith(old_ext):
                         f_match = re.match(rf"^{re.escape(old_prefix)}{re.escape(old_sep)}(\d+){re.escape(old_ext)}$", f)
                         if f_match:
-                            frame_num = f_match.group(1)
-                            # Apply new padding if changed
-                            new_frame = frame_num.zfill(new_pad)
-                            f_old = os.path.join(parent_dir, f)
-                            f_new = os.path.join(parent_dir, f"{new_prefix}{new_sep}{new_frame}{new_ext}")
+                            files_to_rename.append((f, f_match.group(1)))
                             
-                            if f_old != f_new:
-                                os.rename(f_old, f_new)
-                                count += 1
+                total_files = len(files_to_rename)
+                if total_files > 0:
+                    self.status_label.setText(f"Renaming {total_files} files...")
+                    self.progress_bar.setRange(0, total_files)
+                    self.progress_bar.setValue(0)
+                    self.progress_bar.show()
+                    
+                count = 0
+                for i, (f, frame_num) in enumerate(files_to_rename):
+                    new_frame = frame_num.zfill(new_pad)
+                    f_old = os.path.join(parent_dir, f)
+                    f_new = os.path.join(parent_dir, f"{new_prefix}{new_sep}{new_frame}{new_ext}")
+                    
+                    if f_old != f_new:
+                        os.rename(f_old, f_new)
+                        count += 1
+                        
+                    if i % 10 == 0:
+                        self.progress_bar.setValue(i + 1)
+                        QtWidgets.QApplication.processEvents()
+                        
+                if total_files > 0:
+                    self.progress_bar.setValue(total_files)
+                    QtCore.QTimer.singleShot(1000, self.progress_bar.hide)
                 
                 self.status_label.setText(f"Renamed {count} files in sequence to '{new_prefix}'")
             else:
@@ -2354,7 +2812,14 @@ class Kadatha(QtWidgets.QWidget):
         deleted_count = 0
         total_files = 0
         
-        for item in items_to_delete:
+        total_items = len(items_to_delete)
+        if total_items > 0:
+            self.status_label.setText(f"Deleting {total_items} items...")
+            self.progress_bar.setRange(0, total_items)
+            self.progress_bar.setValue(0)
+            self.progress_bar.show()
+        
+        for i, item in enumerate(items_to_delete):
             path = item.get("path")
             if not path: continue
             
@@ -2368,14 +2833,19 @@ class Kadatha(QtWidgets.QWidget):
                     if match:
                         prefix, sep, token, ext = match.groups()
                         
-                        for f in os.listdir(parent_dir):
+                        for f_idx, f in enumerate(os.listdir(parent_dir)):
                             if f.startswith(prefix) and f.endswith(ext):
                                 f_match = re.match(rf"^{re.escape(prefix)}{re.escape(sep)}(\d+){re.escape(ext)}$", f)
                                 if f_match:
                                     os.remove(os.path.join(parent_dir, f))
                                     total_files += 1
+                                    
+                            if f_idx % 50 == 0:
+                                QtWidgets.QApplication.processEvents()
                     deleted_count += 1
                 elif item.get("is_folder"):
+                    self.status_label.setText(f"Deleting folder {os.path.basename(path)}...")
+                    QtWidgets.QApplication.processEvents()
                     shutil.rmtree(path)
                     deleted_count += 1
                 else:
@@ -2384,6 +2854,12 @@ class Kadatha(QtWidgets.QWidget):
             except Exception as e:
                 errors.append(f"{os.path.basename(path)}: {e}")
                 
+            self.progress_bar.setValue(i + 1)
+            QtWidgets.QApplication.processEvents()
+            
+        if total_items > 0:
+            QtCore.QTimer.singleShot(1000, self.progress_bar.hide)
+            
         if errors:
             QtWidgets.QMessageBox.critical(self, "Delete Errors", "Some items could not be deleted:\n\n" + "\n".join(errors))
         

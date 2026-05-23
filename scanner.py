@@ -9,6 +9,52 @@ except ImportError:
     pwd = None  # Not available on Windows
 from concurrent.futures import ThreadPoolExecutor
 
+# Thread-safe Windows ctypes setup for file owner resolution
+_win_security_initialized = False
+_win_security_lock = threading.Lock()
+_GetNamedSecurityInfoW = None
+_LookupAccountSidW = None
+_LocalFree = None
+
+def _init_win_security():
+    global _win_security_initialized, _GetNamedSecurityInfoW, _LookupAccountSidW, _LocalFree
+    if _win_security_initialized:
+        return
+    with _win_security_lock:
+        if _win_security_initialized:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            advapi32 = ctypes.windll.advapi32
+            kernel32 = ctypes.windll.kernel32
+            
+            _GetNamedSecurityInfoW = advapi32.GetNamedSecurityInfoW
+            _GetNamedSecurityInfoW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p)
+            ]
+            _GetNamedSecurityInfoW.restype = wintypes.DWORD
+            
+            _LookupAccountSidW = advapi32.LookupAccountSidW
+            _LookupAccountSidW.argtypes = [
+                wintypes.LPCWSTR, ctypes.c_void_p, wintypes.LPWSTR, 
+                wintypes.LPDWORD, wintypes.LPWSTR, wintypes.LPDWORD, ctypes.POINTER(wintypes.DWORD)
+            ]
+            _LookupAccountSidW.restype = wintypes.BOOL
+            
+            _LocalFree = kernel32.LocalFree
+            _LocalFree.argtypes = [ctypes.c_void_p]
+            _LocalFree.restype = ctypes.c_void_p
+            
+            _win_security_initialized = True
+        except Exception as e:
+            # Fall back to standard error output or ignore
+            pass
+
 class FileScanner:
     def __init__(self, config=None):
         self.config = config or {}
@@ -22,14 +68,81 @@ class FileScanner:
         
         self.cancel_event = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        self.owner_cache = {}
+        self.owner_lock = threading.Lock()
         
-    def get_owner(self, st):
-        if pwd:
+    def get_owner(self, path, st=None):
+        if not path:
+            return "unknown"
+            
+        # Fast cache check with thread safety
+        with self.owner_lock:
+            if path in self.owner_cache:
+                return self.owner_cache[path]
+                
+        owner = "unknown"
+        
+        # 1. Try Unix pwd first if available
+        if pwd and st:
             try:
-                return pwd.getpwuid(st.st_uid).pw_name
+                owner = pwd.getpwuid(st.st_uid).pw_name
             except (KeyError, AttributeError):
-                return str(st.st_uid)
-        return "unknown"
+                owner = str(st.st_uid)
+                
+        # 2. Try Windows ctypes implementation
+        elif os.name == 'nt':
+            try:
+                _init_win_security()
+                if _win_security_initialized:
+                    import ctypes
+                    from ctypes import wintypes
+                    
+                    ppsid_owner = ctypes.c_void_p()
+                    pp_sec_desc = ctypes.c_void_p()
+                    
+                    win_path = os.path.normpath(path)
+                    
+                    SE_FILE_OBJECT = 1
+                    OWNER_SECURITY_INFORMATION = 1
+                    
+                    result = _GetNamedSecurityInfoW(
+                        win_path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                        ctypes.byref(ppsid_owner), None, None, None, ctypes.byref(pp_sec_desc)
+                    )
+                    
+                    if result == 0:
+                        try:
+                            name = ctypes.create_unicode_buffer(256)
+                            domain = ctypes.create_unicode_buffer(256)
+                            cch_name = wintypes.DWORD(256)
+                            cch_domain = wintypes.DWORD(256)
+                            pe_use = wintypes.DWORD()
+                            
+                            success = _LookupAccountSidW(
+                                None, ppsid_owner, name, ctypes.byref(cch_name), 
+                                domain, ctypes.byref(cch_domain), ctypes.byref(pe_use)
+                            )
+                            if success:
+                                owner = name.value
+                        finally:
+                            if pp_sec_desc:
+                                _LocalFree(pp_sec_desc)
+            except Exception:
+                pass
+                
+        # 3. Fallback to current logged-in user on Windows if owner resolution fails
+        if owner == "unknown" or not owner:
+            try:
+                import getpass
+                owner = getpass.getuser()
+            except Exception:
+                owner = "unknown"
+                
+        # Cache the result
+        with self.owner_lock:
+            self.owner_cache[path] = owner
+            
+        return owner
 
     def format_size_str(self, size_bytes):
         if size_bytes == 0:
@@ -215,7 +328,7 @@ class FileScanner:
                 
                 total_size = sum(f["stat"].st_size for f in files)
                 max_mtime = max(f["stat"].st_mtime for f in files)
-                owner = self.get_owner(first_f["stat"])
+                owner = self.get_owner(first_f["path"], first_f["stat"])
                 
                 brace_pad = f"%0{pad_len}d"
                 seq_path = f"{dirname}/{prefix}{sep}{brace_pad}{ext}".replace("\\", "/")
@@ -262,7 +375,7 @@ class FileScanner:
             "size": 0 if is_directory else st.st_size,
             "size_str": "" if is_directory else self.format_size_str(st.st_size),
             "date": st.st_mtime,
-            "owner": self.get_owner(st),
+            "owner": self.get_owner(path, st),
             "extension": "" if is_directory else os.path.splitext(name)[1],
             "is_sequence": False,
             "is_folder": is_directory
